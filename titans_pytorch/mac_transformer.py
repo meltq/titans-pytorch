@@ -95,18 +95,19 @@ class MemoryAsContextTransformerWithLLM(Module):
         num_tokens,
         dim,
         depth,
-        llm_model_name: str = "Qwen/Qwen1.5-0.5B", # Default to Qwen 0.5B
+        llm_model_name: str = "Qwen/Qwen1.5-0.5B",
         llm_frozen: bool = True,
         segment_len,
         neural_memory_segment_len = None,
         neural_mem_gate_attn_output = False,
-        num_longterm_mem_tokens = 0, # How h_t is represented (placeholder)
+        num_longterm_mem_tokens = 0,
         num_persist_mem_tokens = 0,
         neural_memory_batch_size = None,
         neural_memory_qkv_receives_diff_views = False,
         ff_mult = 4,
         num_residual_streams = 1,
-        neural_memory_model: Module | None = None,
+        neural_memory_model: Module | None = None, # User can pass a pre-initialized LTM structure
+        ltm_default_depth: int = 2, # *** NEW: Default depth for MemoryMLP ***
         neural_memory_kwargs: dict = dict(),
         neural_memory_layers: tuple[int, ...] | None = None,
         neural_mem_weight_residual = False,
@@ -124,7 +125,7 @@ class MemoryAsContextTransformerWithLLM(Module):
             self.token_emb = nn.Embedding(num_tokens, dim)
         else:
             self.token_emb = token_emb
-        self.num_tokens = num_tokens # Store vocab size
+        self.num_tokens = num_tokens
         self.model_dim = dim
 
         # --- Positional Embedding ---
@@ -137,26 +138,24 @@ class MemoryAsContextTransformerWithLLM(Module):
         else:
              self.persist_mems = None
 
-        self.num_longterm_mem_tokens = num_longterm_mem_tokens # Config only for now
+        self.num_longterm_mem_tokens = num_longterm_mem_tokens
         self.segment_len = segment_len
 
         # --- LLM Integration ---
         print(f"Loading LLM: {llm_model_name}")
-        self.llm_config = AutoConfig.from_pretrained(llm_model_name, trust_remote_code=True) # Qwen requires trust_remote_code
+        self.llm_config = AutoConfig.from_pretrained(llm_model_name, trust_remote_code=True)
         self.llm = AutoModel.from_pretrained(llm_model_name, trust_remote_code=True)
-        # Load tokenizer associated with the LLM for sampling
         self.tokenizer = AutoTokenizer.from_pretrained(llm_model_name, trust_remote_code=True)
 
         if llm_frozen:
             print("Freezing LLM weights.")
             for param in self.llm.parameters():
                 param.requires_grad = False
-            self.llm.eval() # Set LLM to eval mode if frozen
+            self.llm.eval()
 
         self.llm_hidden_dim = self.llm_config.hidden_size
         print(f"LLM hidden dim: {self.llm_hidden_dim}, Model dim: {dim}")
         self.llm_output_proj = nn.Linear(self.llm_hidden_dim, dim) if self.llm_hidden_dim != dim else nn.Identity()
-        # --- End LLM Integration ---
 
         # --- Hyper Connections ---
         init_hyper_conn, self.expand_streams, self.reduce_streams = get_init_and_expand_reduce_stream_functions(num_residual_streams, dim = dim, add_stream_embed = True, disable = num_residual_streams == 1)
@@ -185,12 +184,22 @@ class MemoryAsContextTransformerWithLLM(Module):
                         Rearrange('... (views layers) -> views ... layers', views = 3),
                         nn.Softmax(dim = -1)
                     )
-                ltm_model_instance = deepcopy(neural_memory_model) if exists(neural_memory_model) else MemoryMLP(dim) # Use model dim for LTM MLP
+
+                # *** THE FIX IS HERE ***
+                if exists(neural_memory_model):
+                    # If user provided a specific LTM structure, use it
+                    ltm_model_instance = deepcopy(neural_memory_model)
+                else:
+                    # Otherwise, create default MemoryMLP using dim AND the new default depth
+                    print(f"Layer {layer}: Initializing default MemoryMLP(dim={dim}, depth={ltm_default_depth}) for LTM.")
+                    ltm_model_instance = MemoryMLP(dim=dim, depth=ltm_default_depth)
+                # *** END FIX ***
+
                 mem = NeuralMemory(
                     dim = dim,
                     chunk_size = self.neural_memory_segment_len,
                     batch_size = neural_memory_batch_size,
-                    model = ltm_model_instance,
+                    model = ltm_model_instance, # Pass the created/copied instance
                     qkv_receives_diff_views = neural_memory_qkv_receives_diff_views,
                     accept_weight_residual = neural_mem_weight_residual and not is_first_neural_mem,
                     **neural_memory_kwargs
@@ -203,7 +212,7 @@ class MemoryAsContextTransformerWithLLM(Module):
 
             self.layers.append(ModuleList([
                 mem_hyper_conn, llm_hyper_conn, ff_hyper_conn,
-                mem_qkv_layer_selector, mem, None, ff # None at index 5 (attn placeholder)
+                mem_qkv_layer_selector, mem, None, ff
             ]))
 
         # --- Final Output Layers ---
@@ -211,6 +220,226 @@ class MemoryAsContextTransformerWithLLM(Module):
         self.to_logits = LinearNoBias(dim, num_tokens)
         self.gate_llm_output = neural_mem_gate_attn_output
         self.register_buffer('zero', torch.tensor(0.), persistent = False)
+
+    # ... (Keep the format_input_for_llm, forward, and sample methods as defined before) ...
+    # Make sure the rest of the class definition follows here
+    def format_input_for_llm(self, persistent_mem, current_segment_embeds):
+        """
+        Formats input for the LLM (Qwen1.5-0.5B).
+        Assumes h_t (history) is NOT explicitly prepended here, simplifying the logic.
+        Focuses on combining persistent memory (P) and the current segment (S_t).
+
+        Args:
+            persistent_mem (Tensor | None): Shape (num_persist, dim) or None.
+            current_segment_embeds (Tensor): Shape (batch, seg_len, dim).
+
+        Returns:
+            inputs_embeds (Tensor): Shape (batch, combined_len, dim).
+            attention_mask (Tensor): Shape (batch, combined_len).
+            segment_len (int): Original length of current_segment_embeds.
+        """
+        batch_size, segment_len, dim = current_segment_embeds.shape
+        device = current_segment_embeds.device
+        inputs_list = []
+        mask_list = []
+
+        # 1. Persistent Memory
+        len_p = 0
+        if exists(persistent_mem):
+            len_p = persistent_mem.shape[0]
+            p_expanded = persistent_mem.unsqueeze(0).expand(batch_size, -1, -1) # (batch, num_persist, dim)
+            inputs_list.append(p_expanded)
+            mask_list.append(torch.ones(batch_size, len_p, dtype=torch.long, device=device))
+
+        # 2. Current Segment
+        inputs_list.append(current_segment_embeds)
+        mask_list.append(torch.ones(batch_size, segment_len, dtype=torch.long, device=device))
+
+        # 3. Combine
+        combined_embeds = torch.cat(inputs_list, dim=1) # (batch, len_p + seg_len, dim)
+        attention_mask = torch.cat(mask_list, dim=1) # (batch, len_p + seg_len)
+
+        # Note: Using a simple 'ones' mask. A causal mask might be needed depending on LLM and task.
+        # combined_len = combined_embeds.shape[1]
+        # causal_mask = torch.tril(torch.ones((combined_len, combined_len), dtype=torch.bool, device=device))
+        # attention_mask = causal_mask.unsqueeze(0).expand(batch_size, -1, -1) # Check LLM expected mask format
+
+        return combined_embeds, attention_mask, segment_len # Return original segment len too
+
+    def forward(
+        self,
+        x, # Input token IDs: (batch, seq_len)
+        return_loss = False, # Flag to compute loss
+        ltm_state: Optional[NeuralMemState] = None, # Allow passing initial LTM state
+        return_ltm_state: bool = False # Flag to return final LTM state
+    ):
+
+        if return_loss: # Prepare inputs and labels for loss calculation
+            x, labels = x[:, :-1], x[:, 1:]
+
+        batch, seq_len = x.shape # Get batch size and sequence length
+        device = x.device
+
+        # --- Initial Processing ---
+        x_embed = self.token_emb(x) # Convert token IDs to embeddings: (batch, seq_len, dim)
+        pos_emb = self.axial_pos_emb.forward_with_seq_len(seq_len, (self.neural_memory_segment_len,))
+        x_embed = x_embed + pos_emb.to(device) # Add positional embeddings
+
+        # --- LTM State ---
+        current_ltm_state = ltm_state # Use passed state or None (NeuralMemory handles init)
+        mem_weight_residual = None # For LTM weight residual connection
+
+        # --- Layer Loop ---
+        x_residual = x_embed # Input to the first layer
+        x = self.expand_streams(x_residual) # Expand for hyper-connections
+        mem_input_layers = [] # Store intermediate layer outputs
+
+        for layer_idx, (mem_hyper_conn, llm_hyper_conn, ff_hyper_conn, mem_qkv_layer_selector, mem, _, ff) in enumerate(self.layers): # Iterate through layer components
+
+            layer_input = x # Store input to this layer block for potential LTM QKV selection
+            mem_input_layers.append(layer_input)
+
+            ltm_output = None # Output from LTM module
+            llm_output_gates = None # Gating signal from LTM
+
+            # --- Neural Memory (LTM) ---
+            if exists(mem): # If this layer includes an LTM module
+                mem_input, add_residual_mem = mem_hyper_conn(x) # Get input via hyper-conn
+                qkv_mem_input = stack((mem_input, mem_input, mem_input)) # Default: use same input for QKV
+                if exists(mem_qkv_layer_selector):
+                    layers_to_choose_from = stack((mem_input, *mem_input_layers))
+                    selected = mem_qkv_layer_selector(mem_input)
+                    qkv_mem_input = einsum(layers_to_choose_from, selected, 'l b n d, v b n l -> v b n d')
+
+                # Call LTM forward - Assuming it handles updates and returns output + state
+                ltm_output, current_ltm_state = mem.forward(
+                    qkv_mem_input, # Should be features, not IDs
+                    state = current_ltm_state,
+                    prev_weights = mem_weight_residual
+                    # Pass other args like store_mask if needed
+                )
+                # Update weight residual if applicable
+                if self.neural_mem_weight_residual and hasattr(current_ltm_state, 'updates'):
+                    mem_weight_residual = current_ltm_state.updates
+
+                # Apply LTM output (either gating or residual)
+                if self.gate_llm_output:
+                    llm_output_gates = ltm_output.sigmoid()
+                else:
+                    x = add_residual_mem(ltm_output)
+
+            # Store LTM block output
+            mem_input_layers.append(x)
+
+            # --- LLM (Short-Term Memory) ---
+            llm_input_stream, add_residual_llm = llm_hyper_conn(x) # Get input via hyper-conn
+            mem_input_layers.append(llm_input_stream) # Store LLM block input
+
+            # Prepare input for LLM
+            current_segment_embeds = llm_input_stream
+            persistent_mem_embeds = self.persist_mems if exists(self.persist_mems) else None
+            # Assuming h_t is not explicitly passed here based on previous decision
+            history_mem_embeds = None
+
+            llm_input_embeds, llm_attention_mask, orig_segment_len = self.format_input_for_llm(
+                persistent_mem_embeds,
+                current_segment_embeds
+            )
+
+            # Call the LLM
+            context_manager = torch.no_grad() if not self.llm.training else torch.enable_grad()
+            with context_manager:
+                 llm_outputs = self.llm(
+                     inputs_embeds=llm_input_embeds,
+                     attention_mask=llm_attention_mask,
+                     return_dict=True
+                 )
+            y_t = llm_outputs.last_hidden_state # (batch, combined_len, llm_hidden_dim)
+
+            # Extract the part corresponding to the original segment and project
+            y_t_processed = y_t[:, -orig_segment_len:, :] # Take the last part corresponding to S_t
+            y_t_projected = self.llm_output_proj(y_t_processed) # Project to model dim
+
+            # Apply optional gating from LTM
+            if exists(llm_output_gates):
+                 # Ensure gates have compatible shape (batch, orig_segment_len, dim)
+                 y_t_projected = y_t_projected * llm_output_gates[:, -orig_segment_len:, :] # Apply gating
+
+            # Add residual connection for the LLM block
+            x = add_residual_llm(y_t_projected)
+            mem_input_layers.append(x) # Store LLM block output
+
+            # --- FeedForward ---
+            ff_in, add_ff_residual = ff_hyper_conn(x)
+            mem_input_layers.append(ff_in)
+            ff_out = ff(ff_in)
+            x = add_ff_residual(ff_out)
+            mem_input_layers.append(x)
+
+        # --- Final Output ---
+        x = self.reduce_streams(x) # Reduce streams if hyper-connections used
+        x = self.norm(x) # Final normalization
+        logits = self.to_logits(x) # Project to vocabulary logits
+
+        # Prepare results
+        result = (logits,)
+        if return_loss:
+            loss = F.cross_entropy(rearrange(logits, 'b n l -> b l n'), labels)
+            result = (loss,) + result
+        if return_ltm_state:
+            result = result + (current_ltm_state,)
+
+        if len(result) == 1:
+            return result[0]
+
+        return result
+
+
+    @torch.no_grad()
+    def sample(
+        self,
+        prompt: Tensor, # Input token IDs: (batch, prompt_len)
+        seq_len: int, # Total desired sequence length (including prompt)
+        temperature=1.0,
+        filter_thres=0.9, # Example filter (top_p)
+        **kwargs # Allow passing other generation config args
+    ):
+        """
+        Basic sampling using the LLM's .generate() method.
+        WARNING: This method DOES NOT update the LTM state during generation.
+        A custom generation loop is needed for stateful LTM sampling.
+        """
+        self.eval() # Ensure model is in eval mode
+
+        if not exists(self.tokenizer):
+             print("Warning: Tokenizer not loaded. Cannot use LLM generate. Returning prompt.")
+             return prompt
+
+        # Ensure prompt is on the same device as the LLM
+        device = next(self.llm.parameters()).device
+        prompt = prompt.to(device)
+
+        print("Warning: Using basic LLM generate, LTM state is NOT updated during sampling.")
+
+        # Prepare generation config
+        gen_config = GenerationConfig(
+             max_length=seq_len,
+             temperature=temperature,
+             top_p=filter_thres,
+             pad_token_id=self.tokenizer.eos_token_id, # Use EOS for padding
+             eos_token_id=self.tokenizer.eos_token_id,
+             **kwargs
+        )
+
+        # Generate sequence using the underlying LLM directly
+        output_ids = self.llm.generate(
+             input_ids=prompt,
+             generation_config=gen_config
+        )
+
+        # Return only the generated part (excluding the prompt)
+        prompt_len = prompt.shape[1]
+        return output_ids[:, prompt_len:]
 
     def format_input_for_llm(self, persistent_mem, current_segment_embeds):
         """
