@@ -13,5 +13,5 @@ from titans_pytorch.memory_models import (
 )
 
 from titans_pytorch.mac_transformer import (
-    MemoryAsContextTransformer
+    MemoryAsContextTransformerWithLLM
 )
