@@ -450,26 +450,53 @@ class MemoryAsContextTransformerWithLLM(Module):
 
         print("Warning: Using basic LLM generate, LTM state is NOT updated during sampling.")
 
-        # Prepare generation config
-        gen_config = GenerationConfig(
-             max_length=seq_len,
-             temperature=temperature,
-             top_p=filter_thres,
-             pad_token_id=self.tokenizer.eos_token_id, # Use EOS for padding
-             eos_token_id=self.tokenizer.eos_token_id,
-             **kwargs
-        )
+        # --- Prepare GenerationConfig ---
+        # Start with default config from the model if available, or empty
+        model_gen_config = getattr(self.llm, "generation_config", None)
+        if model_gen_config:
+            gen_config = GenerationConfig.from_dict(model_gen_config.to_dict())
+        else:
+            gen_config = GenerationConfig()
 
-        # Generate sequence using the underlying LLM directly
-        # Now self.llm is AutoModelForCausalLM, so it has .generate()
+        # Set specific parameters, overriding defaults or kwargs if needed
+        gen_config.max_length = seq_len
+        gen_config.temperature = temperature
+        gen_config.top_p = filter_thres
+        gen_config.pad_token_id = self.tokenizer.eos_token_id # Use EOS for padding
+        gen_config.eos_token_id = self.tokenizer.eos_token_id
+
+        # Update config with any *other* kwargs provided to sample,
+        # avoiding explicit duplicates we just set.
+        explicit_args = {'max_length', 'temperature', 'top_p', 'pad_token_id', 'eos_token_id'}
+        for key, value in kwargs.items():
+            if key not in explicit_args and hasattr(gen_config, key):
+                 setattr(gen_config, key, value)
+            elif key not in explicit_args:
+                 # Pass arguments not part of GenerationConfig directly to generate
+                 # This might still cause issues if they conflict internally
+                 print(f"Warning: Passing unknown argument '{key}' directly to generate.")
+
+
+        # Filter kwargs passed directly to generate to avoid duplicates with GenerationConfig
+        filtered_kwargs = {k: v for k, v in kwargs.items() if not hasattr(gen_config, k)}
+
+
+        # --- Generate sequence ---
+        # Pass only the config object and filtered kwargs
         output_ids = self.llm.generate(
              input_ids=prompt,
-             generation_config=gen_config
+             generation_config=gen_config,
+             **filtered_kwargs # Pass only non-config kwargs
         )
 
         # Return only the generated part (excluding the prompt)
         prompt_len = prompt.shape[1]
-        return output_ids[:, prompt_len:]
+        # Ensure output is long enough before slicing
+        if output_ids.shape[1] > prompt_len:
+            return output_ids[:, prompt_len:]
+        else:
+            # Handle cases where generation didn't add tokens (e.g., prompt == max_length)
+            return torch.tensor([], dtype=torch.long, device=device) # Return empty tensor
 
     # ... (Keep the format_input_for_llm, forward, and sample methods as defined before) ...
     # Make sure the rest of the class definition follows here
