@@ -471,16 +471,6 @@ class MemoryAsContextTransformerWithLLM(Module):
         prompt_len = prompt.shape[1]
         return output_ids[:, prompt_len:]
 
-```
-
-**Explanation of the Fix:**
-
-1.  **Import Change:** Changed `from transformers import AutoModel` to `from transformers import AutoModelForCausalLM`.
-2.  **LLM Loading:** Changed `self.llm = AutoModel.from_pretrained(...)` to `self.llm = AutoModelForCausalLM.from_pretrained(...)`.
-3.  **Forward Pass Output:** Added `output_hidden_states=True` to the `self.llm` call in `forward` and adjusted logic to retrieve `last_hidden_state` from `llm_outputs.hidden_states[-1]`, as the output structure of `*ForCausalLM` models differs from base models. Added basic error handling if hidden states aren't returned.
-4.  **Sample Method:** The `sample` method should now work correctly (in terms of calling `.generate()`) because `self.llm` is now an instance of `Qwen2ForCausalLM` which *does* have the `.generate()` method. The warning about LTM state not being updated still applies.
-
-With this change, the `TypeError` should be resolved, and the `sample` method will correctly call the underlying LLM's generation function. Remember to test thoroughly, especially the interaction points and dimension alignmen
     # ... (Keep the format_input_for_llm, forward, and sample methods as defined before) ...
     # Make sure the rest of the class definition follows here
     def format_input_for_llm(self, persistent_mem, current_segment_embeds):
